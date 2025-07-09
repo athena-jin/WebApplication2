@@ -1,74 +1,109 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace WebApplication2.Services
 {
+    public class CustomerRank : IComparable<CustomerRank>
+    {
+        public long CustomerID { get; set; }
+        public decimal Score { get; set; }
+
+        public int CompareTo(CustomerRank? other)
+        {
+            if (other == null) return -1;
+            int cmp = other.Score.CompareTo(Score); // 分数降序
+            if (cmp != 0) return cmp;
+            return CustomerID.CompareTo(other.CustomerID); // ID升序
+        }
+    }
+
     public class LeaderboardService
     {
-        private readonly ConcurrentDictionary<long, Customer> _customers = new();
-        private volatile List<Customer> _sortedLeaderboard = new();
+        private readonly ConcurrentDictionary<long, CustomerRank> _customerMap = new();
+        private readonly SortedSet<CustomerRank> _leaderboard = new();
         private readonly object _lock = new();
 
         public decimal UpdateScore(long customerId, decimal delta)
         {
-            _customers.AddOrUpdate(
-                customerId,
-                id => new Customer { CustomerID = id, Score = delta },
-                (id, existing) => { existing.Score += delta; return existing; }
-            );
-            UpdateLeaderboard();
-            return _customers[customerId].Score;
-        }
-
-        private void UpdateLeaderboard()
-        {
             lock (_lock)
             {
-                _sortedLeaderboard = _customers.Values
-                    .Where(c => c.Score > 0)
-                    .OrderByDescending(c => c.Score)
-                    .ThenBy(c => c.CustomerID)
-                    .ToList();
+                if (!_customerMap.TryGetValue(customerId, out var oldRank))
+                {
+                    var newScore = delta;
+                    if (newScore > 0)
+                    {
+                        var newRank = new CustomerRank { CustomerID = customerId, Score = newScore };
+                        _leaderboard.Add(newRank);
+                        _customerMap[customerId] = newRank;
+                    }
+                    return newScore;
+                }
+                else
+                {
+                    _leaderboard.Remove(oldRank);
+                    var newScore = oldRank.Score + delta;
+                    if (newScore > 0)
+                    {
+                        var newRank = new CustomerRank { CustomerID = customerId, Score = newScore };
+                        _leaderboard.Add(newRank);
+                        _customerMap[customerId] = newRank;
+                    }
+                    else
+                    {
+                        _customerMap.TryRemove(customerId, out _);
+                    }
+                    return newScore;
+                }
             }
         }
 
         public List<(Customer customer, int rank)> GetByRank(int start, int end)
         {
-            var leaderboard = _sortedLeaderboard;
-            var result = new List<(Customer, int)>();
-            for (int i = start - 1; i < end && i < leaderboard.Count; i++)
+            lock (_lock)
             {
-                result.Add((leaderboard[i], i + 1));
+                var result = new List<(Customer, int)>();
+                int idx = 1;
+                foreach (var rank in _leaderboard)
+                {
+                    if (idx > end) break;
+                    if (idx >= start)
+                        result.Add((new Customer { CustomerID = rank.CustomerID, Score = rank.Score }, idx));
+                    idx++;
+                }
+                return result;
             }
-            return result;
         }
 
         public List<(Customer customer, int rank)> GetByCustomerId(long customerId, int high, int low)
         {
-            var leaderboard = _sortedLeaderboard;
-            int idx = leaderboard.FindIndex(c => c.CustomerID == customerId);
-            if (idx == -1) return new();
-
-            int start = Math.Max(0, idx - high);
-            int end = Math.Min(leaderboard.Count - 1, idx + low);
-
-            var result = new List<(Customer, int)>();
-            for (int i = start; i <= end; i++)
+            lock (_lock)
             {
-                result.Add((leaderboard[i], i + 1));
+                if (!_customerMap.TryGetValue(customerId, out var target)) return new();
+                var list = _leaderboard.ToList();
+                int idx = list.FindIndex(x => x.CustomerID == customerId);
+                if (idx == -1) return new();
+                int start = Math.Max(0, idx - high);
+                int end = Math.Min(list.Count - 1, idx + low);
+                var result = new List<(Customer, int)>();
+                for (int i = start; i <= end; i++)
+                {
+                    var c = list[i];
+                    result.Add((new Customer { CustomerID = c.CustomerID, Score = c.Score }, i + 1));
+                }
+                return result;
             }
-            return result;
         }
 
         public int? GetRank(long customerId)
         {
-            var leaderboard = _sortedLeaderboard;
-            for (int i = 0; i < leaderboard.Count; i++)
+            lock (_lock)
             {
-                if (leaderboard[i].CustomerID == customerId)
-                    return i + 1;
+                var list = _leaderboard.ToList();
+                int idx = list.FindIndex(x => x.CustomerID == customerId);
+                return idx == -1 ? null : idx + 1;
             }
-            return null;
         }
     }
 
